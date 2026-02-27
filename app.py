@@ -1,4 +1,5 @@
 import os
+import re
 import hmac
 import hashlib
 import requests
@@ -7,22 +8,21 @@ from flask import Flask, request, jsonify
 app = Flask(__name__)
 
 # ── Load config from environment variables ──────────────────────────────────
-VERIFY_TOKEN         = os.environ["VERIFY_TOKEN"]           # any string you choose
-WHATSAPP_TOKEN       = os.environ["WHATSAPP_TOKEN"]         # Meta permanent system-user token
-WHATSAPP_PHONE_ID    = os.environ["WHATSAPP_PHONE_ID"]      # Meta phone number ID
-WHATSAPP_APP_SECRET  = os.environ["WHATSAPP_APP_SECRET"]    # Meta app secret
+VERIFY_TOKEN         = os.environ["VERIFY_TOKEN"]
+WHATSAPP_TOKEN       = os.environ["WHATSAPP_TOKEN"]
+WHATSAPP_PHONE_ID    = os.environ["WHATSAPP_PHONE_ID"]
+WHATSAPP_APP_SECRET  = os.environ["WHATSAPP_APP_SECRET"]
 
-LARK_APP_ID          = os.environ["LARK_APP_ID"]            # Lark bot App ID
-LARK_APP_SECRET      = os.environ["LARK_APP_SECRET"]        # Lark bot App Secret
-LARK_CHAT_ID         = os.environ["LARK_CHAT_ID"]           # Lark group chat ID
+LARK_APP_ID          = os.environ["LARK_APP_ID"]
+LARK_APP_SECRET      = os.environ["LARK_APP_SECRET"]
+LARK_CHAT_ID         = os.environ["LARK_CHAT_ID"]
 
 # In-memory store mapping Lark message thread → WhatsApp number
-# (persists while the server is running)
 thread_to_wa: dict[str, str] = {}
 wa_to_thread: dict[str, str] = {}
 
 
-# ── Helpers ─────────────────────────────────────────────────────────────────
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
 def get_lark_token() -> str:
     """Get a short-lived Lark tenant access token."""
@@ -38,12 +38,11 @@ def get_lark_token() -> str:
 def send_to_lark(wa_number: str, message: str) -> str:
     """
     Post an incoming WhatsApp message to the Lark group chat.
-    Returns the root_id of the posted message (used to thread replies).
+    Returns the message_id of the posted message (used to thread replies).
     """
     token = get_lark_token()
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-    # If we already have a thread for this contact, reply into it
     root_id = wa_to_thread.get(wa_number)
     payload = {
         "receive_id": LARK_CHAT_ID,
@@ -63,7 +62,7 @@ def send_to_lark(wa_number: str, message: str) -> str:
     data = resp.json()
     msg_id = data["data"]["message_id"]
 
-    # If this is a new conversation, the first message IS the root
+    # First message from this number — store the root thread
     if not root_id:
         wa_to_thread[wa_number] = msg_id
         thread_to_wa[msg_id] = wa_number
@@ -97,17 +96,24 @@ def verify_whatsapp_signature(request) -> bool:
     return hmac.compare_digest(signature, expected)
 
 
-# ── WhatsApp webhook ─────────────────────────────────────────────────────────
+def strip_mentions(text: str) -> str:
+    """Remove @mentions like @WhatsApp Bridge from text."""
+    # Remove @mentions (e.g. @SomeName)
+    cleaned = re.sub(r'@\S+(?:\s+\S+)*?(?=\s|$)', '', text)
+    # Also remove any remaining @ symbols with following words
+    cleaned = re.sub(r'@[^\s]*', '', cleaned)
+    return cleaned.strip()
+
+
+# ── WhatsApp webhook ──────────────────────────────────────────────────────────
 
 @app.route("/webhook/whatsapp", methods=["GET", "POST"])
 def whatsapp_webhook():
-    # Meta verification handshake
     if request.method == "GET":
         if request.args.get("hub.verify_token") == VERIFY_TOKEN:
             return request.args.get("hub.challenge", ""), 200
         return "Forbidden", 403
 
-    # Incoming message
     if not verify_whatsapp_signature(request):
         return "Unauthorized", 401
 
@@ -127,13 +133,13 @@ def whatsapp_webhook():
     return jsonify({"status": "ok"}), 200
 
 
-# ── Lark webhook ─────────────────────────────────────────────────────────────
+# ── Lark webhook ──────────────────────────────────────────────────────────────
 
 @app.route("/webhook/lark", methods=["POST"])
 def lark_webhook():
     data = request.json
 
-    # Lark URL verification (first-time setup)
+    # Lark URL verification
     if data.get("type") == "url_verification":
         return jsonify({"challenge": data["challenge"]})
 
@@ -141,7 +147,7 @@ def lark_webhook():
         event = data.get("event", {})
         msg   = event.get("message", {})
 
-        # Only handle text messages sent by humans (not the bot itself)
+        # Ignore messages sent by the bot itself
         sender_type = event.get("sender", {}).get("sender_type", "")
         if sender_type == "app":
             return jsonify({"status": "ignored"}), 200
@@ -151,15 +157,34 @@ def lark_webhook():
             return jsonify({"status": "ignored"}), 200
 
         import json as _json
-        text    = _json.loads(msg.get("content", "{}")).get("text", "").strip()
-        root_id = msg.get("root_id") or msg.get("message_id")
+        raw_text = _json.loads(msg.get("content", "{}")).get("text", "").strip()
+        
+        # Strip @mentions from the reply
+        text = strip_mentions(raw_text)
+        
+        if not text:
+            return jsonify({"status": "empty_after_strip"}), 200
 
-        # Look up which WhatsApp number this thread belongs to
-        wa_number = thread_to_wa.get(root_id)
+        # Check root_id first, then parent_id, then message_id
+        root_id   = msg.get("root_id")
+        parent_id = msg.get("parent_id")
+        msg_id    = msg.get("message_id")
+
+        app.logger.info(f"Lark reply: root_id={root_id}, parent_id={parent_id}, msg_id={msg_id}")
+        app.logger.info(f"thread_to_wa keys: {list(thread_to_wa.keys())}")
+
+        # Try to find the WhatsApp number from any of the IDs
+        wa_number = (
+            thread_to_wa.get(root_id) or
+            thread_to_wa.get(parent_id) or
+            thread_to_wa.get(msg_id)
+        )
+
         if not wa_number:
-            # Message not linked to any WhatsApp conversation — ignore
+            app.logger.warning(f"No WhatsApp thread found for root_id={root_id}")
             return jsonify({"status": "no_thread"}), 200
 
+        app.logger.info(f"Sending to WhatsApp {wa_number}: {text}")
         send_to_whatsapp(wa_number, text)
 
     except Exception as e:
